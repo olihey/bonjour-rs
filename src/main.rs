@@ -6,6 +6,7 @@ extern crate log;
 extern crate env_logger;
 extern crate byteorder;
 
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 #[cfg(not(windows))]
 use net2::unix::UnixUdpBuilderExt;
@@ -86,8 +87,10 @@ struct MDNSQuestion {
 
 #[derive(Debug)]
 struct MDNSAnswer {
-    id: u16,
-    flags: u16,
+    name: String,
+    rr_type: MDNSType,
+    rr_class: u16,
+    ttl: u32,
 }
 
 fn decompress_label(packet: &[u8], mut offset: usize) -> (String, usize) {
@@ -186,6 +189,8 @@ fn parse_packet(packet: &[u8]) -> Result<MDNSData, String> {
     };
 
     let mut decode_position = std::mem::size_of::<MDNSPacketHeader>();
+
+    // parse the questions
     for _ in 0..decoded.num_qn {
         // first read the label
         let (label_string, label_offset) = decompress_label(packet, decode_position);
@@ -204,6 +209,49 @@ fn parse_packet(packet: &[u8]) -> Result<MDNSData, String> {
             name: label_string,
             rr_type: MDNSType::from_u16(rr_type),
             rr_class: class_type,
+        });
+    }
+
+    for _ in 0..decoded.num_ans_rr {
+        // first read the label
+        let (label_string, label_offset) = decompress_label(packet, decode_position);
+        // move the offset
+        decode_position += label_offset;
+
+        // now read the uint16 type
+        let rr_type = NetworkEndian::read_u16(&packet[decode_position..(decode_position + 2)]);
+        decode_position += 2;
+        // and the class (uint16)
+        let class_type = NetworkEndian::read_u16(&packet[decode_position..(decode_position + 2)]);
+        decode_position += 2;
+
+        let ttl = NetworkEndian::read_u32(&packet[decode_position..(decode_position + 4)]);
+        decode_position += 4;
+
+        // RR data
+        let data_len = NetworkEndian::read_u16(&packet[decode_position..(decode_position + 2)]);
+        decode_position += 2;
+
+        trace!("Data len: {}, type: {:?}",
+               data_len,
+               MDNSType::from_u16(rr_type));
+
+        match MDNSType::from_u16(rr_type) {
+            MDNSType::TXT => {
+                let mut txt_map: Vec<String> = vec![];
+
+                txt_map.push("Oli".to_string());
+            }
+            _ => {}
+        }
+        decode_position += data_len as usize;
+
+        // Add the create and push the question struct
+        result.answers.push(MDNSAnswer {
+            name: label_string,
+            rr_type: MDNSType::from_u16(rr_type),
+            rr_class: class_type,
+            ttl: ttl,
         });
     }
 
