@@ -4,12 +4,14 @@ extern crate rustc_serialize;
 #[macro_use]
 extern crate log;
 extern crate env_logger;
+extern crate byteorder;
 
 use std::net::Ipv4Addr;
 #[cfg(not(windows))]
 use net2::unix::UnixUdpBuilderExt;
 use net2::UdpBuilder;
 use bincode::rustc_serialize::decode;
+use byteorder::{ByteOrder, NetworkEndian};
 
 #[repr(C)]
 #[repr(packed)]
@@ -25,16 +27,6 @@ struct MDNSPacketHeader {
     num_add_rr: u16,
 }
 
-// #[repr(C)]
-// #[repr(packed)]
-// #[derive(Default)]
-// #[derive(Debug)]
-// #[derive(RustcEncodable, RustcDecodable)]
-// #[derive(Debug)]
-// struct MDNSPacketEntry {
-
-// }
-
 #[derive(Debug)]
 enum MDNSType {
     A,
@@ -44,12 +36,12 @@ enum MDNSType {
     SRV,
     NSEC,
     ANY,
-    UNKNOW(u8),
+    UNKNOW(u16),
 }
 
 impl MDNSType {
     #[doc(hidden)]
-    pub fn from_u8(n: u8) -> MDNSType {
+    pub fn from_u16(n: u16) -> MDNSType {
         match n {
             0x01 => MDNSType::A,
             0x0C => MDNSType::PTR,
@@ -63,7 +55,7 @@ impl MDNSType {
     }
 
     #[doc(hidden)]
-    pub fn to_u8(&self) -> u8 {
+    pub fn to_u16(&self) -> u16 {
         match *self {
             MDNSType::A => 0x01,
             MDNSType::PTR => 0x0C,
@@ -89,6 +81,7 @@ struct MDNSData {
 struct MDNSQuestion {
     name: String,
     rr_type: MDNSType,
+    rr_class: u16,
 }
 
 #[derive(Debug)]
@@ -98,52 +91,92 @@ struct MDNSAnswer {
 }
 
 fn decompress_label(packet: &[u8], mut offset: usize) -> (String, usize) {
+    // create the string
     let mut full_string = String::new();
+    // second offset to let the caller know how much we moved
+    // from the current offset
     let mut label_offset = 0;
 
+    // helper that gets true as soon as we have hit a compress token
+    // the label_offset calculation is different when we have have
+    // a commpressed label
     let mut compressed = false;
 
+    // Now go until we found a string with ZERO length
     while 0 != packet[offset] {
+        // if this is not the first string we have found,
+        // add a . to join them
         if full_string.len() > 0 {
             full_string.push('.');
         }
-        let mut string_size = packet[offset];
 
         trace!("size buffer: {:?}", &packet[offset..(offset + 2)]);
 
-        if 0xC0 == (string_size & 0xC0) {
-            compressed = true;
-            let small_size = packet[offset + 1];
+        // is this a compressed token?
+        if 0xC0 == (packet[offset] & 0xC0) {
+            // yes
+            if false == compressed {
+                compressed = true;
+                // we have moved 2 bytes from the current position in memory
+                label_offset += 2;
+            }
+
+            // now the second byte after the token
+            // is the lower size of the uint16 offset
+            // from the packet start!!!
+            let small_size = packet[offset + 1] as usize;
             trace!("In BIG SIZE: {}", small_size);
-            offset = (string_size & 0x3F) as usize;
+
+            // get the higher size
+            offset = (packet[offset] & 0x3F) as usize;
             trace!("In BIG SIZE_1: {}", offset);
+
+            // shift 8 bits to the left
             offset *= 256;
             trace!("In BIG SIZE_2: {}", offset);
-            offset += small_size as usize;
-            string_size = packet[offset];
-            offset += 1;
-            trace!("BUFFER: {:?}",
-                   &packet[offset..(offset + string_size as usize)]);
-            trace!("In BIG SIZE_3: {} {}", offset, string_size);
-        } else {
-            offset += 1;
+
+            // add the lower part
+            offset += small_size;
+        }
+
+        // get size of the string
+        let string_size = packet[offset] as usize;
+        // jump over the size byte
+        offset += 1;
+
+        trace!("Before UTF8_2: {} {}", offset, string_size);
+        trace!("Before UTF8: {:?}", &packet[offset..(offset + string_size)]);
+
+        // now convert the bytes to a string
+        // TODO: UTF8???? Or ASCII?
+        full_string += std::str::from_utf8(&packet[offset..(offset + string_size)]).unwrap();
+
+        // move to the next token
+        offset += string_size;
+
+        if false == compressed {
+            // if we haven't had a compress token yet
+            // just a the size byte and the string length
+            label_offset += string_size;
             label_offset += 1;
         }
-        full_string += std::str::from_utf8(&packet[offset..(offset + string_size as usize)])
-            .unwrap();
-        offset += string_size as usize;
-        if false == compressed {
-            label_offset += string_size as usize;
-        }
     }
-    label_offset += 1;
+
+    // skip the last ZERO byte indicating the end of the string
+    if false == compressed {
+        // but only if we have NO compressed string
+        label_offset += 1;
+    }
 
     trace!("{:?} {}", full_string, label_offset);
+
+    // done, return the string and the offset we moved
+    // in memory to get the String
     (full_string, label_offset)
 }
 
-fn parse_packet(packet: &[u8]) -> Option<MDNSData> {
-    let decoded: MDNSPacketHeader = decode(&packet[0..12]).unwrap();
+fn parse_packet(packet: &[u8]) -> Result<MDNSData, String> {
+    let decoded: MDNSPacketHeader = try!(decode(&packet[0..12]).map_err(|e| e.to_string()));
 
     let mut result = MDNSData {
         id: decoded.id,
@@ -154,52 +187,29 @@ fn parse_packet(packet: &[u8]) -> Option<MDNSData> {
 
     let mut decode_position = std::mem::size_of::<MDNSPacketHeader>();
     for _ in 0..decoded.num_qn {
+        // first read the label
         let (label_string, label_offset) = decompress_label(packet, decode_position);
+        // move the offset
+        decode_position += label_offset;
 
+        // now read the uint16 type
+        let rr_type = NetworkEndian::read_u16(&packet[decode_position..(decode_position + 2)]);
+        decode_position += 2;
+        // and the class (uint16)
+        let class_type = NetworkEndian::read_u16(&packet[decode_position..(decode_position + 2)]);
+        decode_position += 2;
+
+        // Add the create and push the question struct
         result.questions.push(MDNSQuestion {
             name: label_string,
-            rr_type: MDNSType::from_u8(packet[decode_position]),
+            rr_type: MDNSType::from_u16(rr_type),
+            rr_class: class_type,
         });
-
-        decode_position += label_offset;
-        trace!("decode buffer({}): {:?}",
-               decode_position,
-               &packet[decode_position..(decode_position + 4)]);
-        decode_position += 4;
-
-        //     let mut full_string = String::new();
-        //     while 0 != packet[decode_position] {
-        //         if full_string.len() > 0 {
-        //             full_string.push('.');
-        //         }
-        //         let string_size = packet[decode_position];
-        //         if 0xC0 == (string_size & 0xC0) {
-        //             let new of
-        //         }
-        //         decode_position += 1;
-        //         full_string += std::str::from_utf8(&packet[decode_position..(decode_position +
-        //                                                                      string_size as usize)])
-        //             .unwrap();
-        //         decode_position += string_size as usize;
-        //     }
-        //     decode_position += 1;
-
-        //     result.questions.push(MDNSQuestion {
-        //         name: full_string,
-        //         rr_type: MDNSType::from_u8(packet[decode_position]),
-        //     });
-
-        //     // println!("result: {}", full_string);
-        //     println!("QUESTION: {:?}",
-        //              &packet[decode_position..(decode_position + 24)]);
     }
 
-    // udp_socket.send_to(&packet[..], &src);
-
     trace!("{:?}", decoded);
-    // println!("{:?}", &packet[0..32]);
 
-    Some(result)
+    Ok(result)
 }
 
 
@@ -245,7 +255,8 @@ fn main() {
         let (amt, src) = udp_socket.recv_from(&mut byte_array).unwrap();
         // println!("{:?} {:?}", amt, src);
 
-        let mdns_data = parse_packet(&byte_array[0..amt]);
-        debug!("{:?}", mdns_data);
+        if let Ok(mdns_data) = parse_packet(&byte_array[0..amt]) {
+            debug!("{:?}", mdns_data);
+        }
     }
 }
