@@ -32,7 +32,7 @@ struct MDNSPacketHeader {
 enum MDNSType {
     A,
     PTR,
-    TXT,
+    TXT(Vec<String>),
     AAAA,
     SRV,
     NSEC,
@@ -46,7 +46,7 @@ impl MDNSType {
         match n {
             0x01 => MDNSType::A,
             0x0C => MDNSType::PTR,
-            0x10 => MDNSType::TXT,
+            0x10 => MDNSType::TXT(vec![]),
             0x1C => MDNSType::AAAA,
             0x21 => MDNSType::SRV,
             0x2F => MDNSType::NSEC,
@@ -60,7 +60,7 @@ impl MDNSType {
         match *self {
             MDNSType::A => 0x01,
             MDNSType::PTR => 0x0C,
-            MDNSType::TXT => 0x10,
+            MDNSType::TXT(_) => 0x10,
             MDNSType::AAAA => 0x1C,
             MDNSType::SRV => 0x21,
             MDNSType::NSEC => 0x2F,
@@ -91,6 +91,16 @@ struct MDNSAnswer {
     rr_type: MDNSType,
     rr_class: u16,
     ttl: u32,
+}
+
+#[inline]
+fn label_to_string(packet: &[u8], offset: usize) -> (String, usize) {
+    let string_size = packet[offset] as usize;
+
+    let full_string = String::from_utf8_lossy(&packet[(offset + 1)..(offset + 1 + string_size)])
+        .into_owned();
+
+    (full_string, string_size + 1)
 }
 
 fn decompress_label(packet: &[u8], mut offset: usize) -> (String, usize) {
@@ -229,7 +239,8 @@ fn parse_packet(packet: &[u8]) -> Result<MDNSData, String> {
         decode_position += 4;
 
         // RR data
-        let data_len = NetworkEndian::read_u16(&packet[decode_position..(decode_position + 2)]);
+        let data_len =
+            NetworkEndian::read_u16(&packet[decode_position..(decode_position + 2)]) as usize;
         decode_position += 2;
 
         trace!("Data len: {}, type: {:?}",
@@ -237,14 +248,20 @@ fn parse_packet(packet: &[u8]) -> Result<MDNSData, String> {
                MDNSType::from_u16(rr_type));
 
         match MDNSType::from_u16(rr_type) {
-            MDNSType::TXT => {
-                let mut txt_map: Vec<String> = vec![];
-
-                txt_map.push("Oli".to_string());
+            MDNSType::TXT(ref mut txt_map) => {
+                let mut data_offset: usize = 0;
+                while data_len > data_offset {
+                    let (label_string, label_size) = label_to_string(packet,
+                                                                     decode_position + data_offset);
+                    trace!("TXT: {} {}", label_string, label_size);
+                    txt_map.push(label_string);
+                    data_offset += label_size;
+                }
+                trace!("{:?}", txt_map);
             }
             _ => {}
         }
-        decode_position += data_len as usize;
+        decode_position += data_len;
 
         // Add the create and push the question struct
         result.answers.push(MDNSAnswer {
