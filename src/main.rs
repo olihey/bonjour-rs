@@ -68,6 +68,25 @@ impl MDNSType {
             MDNSType::UNKNOW(n) => n,
         }
     }
+
+    pub fn from_data(mdns_type_id: u16, packet_data: &[u8]) -> MDNSType {
+        let mut mdns_type = MDNSType::from_u16(mdns_type_id);
+        match mdns_type {
+            MDNSType::TXT(_) => {
+                let mut txt_map = vec![];
+                let mut data_offset: usize = 0;
+                while packet_data.len() > data_offset {
+                    let (label_string, label_size) = label_to_string(packet_data, data_offset);
+                    trace!("TXT: {} {}", label_string, label_size);
+                    txt_map.push(label_string);
+                    data_offset += label_size;
+                }
+                trace!("{:?}", txt_map);
+                MDNSType::TXT(txt_map)
+            }
+            _ => mdns_type,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -247,29 +266,17 @@ fn parse_packet(packet: &[u8]) -> Result<MDNSData, String> {
                data_len,
                MDNSType::from_u16(rr_type));
 
-        match MDNSType::from_u16(rr_type) {
-            MDNSType::TXT(ref mut txt_map) => {
-                let mut data_offset: usize = 0;
-                while data_len > data_offset {
-                    let (label_string, label_size) = label_to_string(packet,
-                                                                     decode_position + data_offset);
-                    trace!("TXT: {} {}", label_string, label_size);
-                    txt_map.push(label_string);
-                    data_offset += label_size;
-                }
-                trace!("{:?}", txt_map);
-            }
-            _ => {}
-        }
-        decode_position += data_len;
-
         // Add the create and push the question struct
         result.answers.push(MDNSAnswer {
             name: label_string,
-            rr_type: MDNSType::from_u16(rr_type),
+            rr_type: MDNSType::from_data(rr_type,
+                                         &packet[decode_position..(decode_position + data_len)]),
             rr_class: class_type,
             ttl: ttl,
         });
+
+        decode_position += data_len;
+
     }
 
     trace!("{:?}", decoded);
