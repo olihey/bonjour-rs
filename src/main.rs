@@ -1,3 +1,6 @@
+// disable warnings for dead code when running debug
+#![cfg_attr(debug_assertions, allow(dead_code))]
+
 extern crate net2;
 extern crate bincode;
 extern crate rustc_serialize;
@@ -6,7 +9,6 @@ extern crate log;
 extern crate env_logger;
 extern crate byteorder;
 
-use std::collections::HashMap;
 use std::net::Ipv4Addr;
 #[cfg(not(windows))]
 use net2::unix::UnixUdpBuilderExt;
@@ -70,8 +72,7 @@ impl MDNSType {
     }
 
     pub fn from_data(mdns_type_id: u16, packet_data: &[u8]) -> MDNSType {
-        let mut mdns_type = MDNSType::from_u16(mdns_type_id);
-        match mdns_type {
+        match MDNSType::from_u16(mdns_type_id) {
             MDNSType::TXT(_) => {
                 let mut txt_map = vec![];
                 let mut data_offset: usize = 0;
@@ -84,7 +85,7 @@ impl MDNSType {
                 trace!("{:?}", txt_map);
                 MDNSType::TXT(txt_map)
             }
-            _ => mdns_type,
+            _ => MDNSType::UNKNOW(mdns_type_id),
         }
     }
 }
@@ -279,7 +280,7 @@ fn parse_packet(packet: &[u8]) -> Result<MDNSData, String> {
 
     }
 
-    trace!("{:?}", decoded);
+    debug!("{:?}", decoded);
 
     Ok(result)
 }
@@ -324,7 +325,7 @@ fn main() {
         // 	let mut read_packet: mdns_packet = Default::default();
         let mut byte_array = [0u8; 65536];
 
-        let (amt, src) = udp_socket.recv_from(&mut byte_array).unwrap();
+        let (amt, _) = udp_socket.recv_from(&mut byte_array).unwrap();
         // println!("{:?} {:?}", amt, src);
 
         if let Ok(mdns_data) = parse_packet(&byte_array[0..amt]) {
