@@ -9,7 +9,7 @@ extern crate log;
 extern crate env_logger;
 extern crate byteorder;
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 #[cfg(not(windows))]
 use net2::unix::UnixUdpBuilderExt;
 use net2::UdpBuilder;
@@ -32,10 +32,10 @@ struct MDNSPacketHeader {
 
 #[derive(Debug)]
 enum MDNSType {
-    A,
+    A(Ipv4Addr),
     PTR,
     TXT(Vec<String>),
-    AAAA,
+    AAAA(Ipv6Addr),
     SRV,
     NSEC,
     ANY,
@@ -44,26 +44,12 @@ enum MDNSType {
 
 impl MDNSType {
     #[doc(hidden)]
-    pub fn from_u16(n: u16) -> MDNSType {
-        match n {
-            0x01 => MDNSType::A,
-            0x0C => MDNSType::PTR,
-            0x10 => MDNSType::TXT(vec![]),
-            0x1C => MDNSType::AAAA,
-            0x21 => MDNSType::SRV,
-            0x2F => MDNSType::NSEC,
-            0xFF => MDNSType::ANY,
-            _ => MDNSType::UNKNOW(n),
-        }
-    }
-
-    #[doc(hidden)]
     pub fn to_u16(&self) -> u16 {
         match *self {
-            MDNSType::A => 0x01,
+            MDNSType::A(_) => 0x01,
             MDNSType::PTR => 0x0C,
             MDNSType::TXT(_) => 0x10,
-            MDNSType::AAAA => 0x1C,
+            MDNSType::AAAA(_) => 0x1C,
             MDNSType::SRV => 0x21,
             MDNSType::NSEC => 0x2F,
             MDNSType::ANY => 0xFF,
@@ -71,9 +57,9 @@ impl MDNSType {
         }
     }
 
-    pub fn from_data(mdns_type_id: u16, packet_data: &[u8]) -> MDNSType {
-        match MDNSType::from_u16(mdns_type_id) {
-            MDNSType::TXT(_) => {
+    pub fn from_data(mdns_type_id: u16, packet_data: &[u8]) -> Result<MDNSType, String> {
+        match mdns_type_id {
+            0x10 => {
                 let mut txt_map = vec![];
                 let mut data_offset: usize = 0;
                 while packet_data.len() > data_offset {
@@ -83,9 +69,43 @@ impl MDNSType {
                     data_offset += label_size;
                 }
                 trace!("{:?}", txt_map);
-                MDNSType::TXT(txt_map)
+                Ok(MDNSType::TXT(txt_map))
             }
-            _ => MDNSType::UNKNOW(mdns_type_id),
+            0x01 => {
+                if packet_data.len() < 4 {
+                    return Err("Data section to small for IPV4 address".to_owned());
+                }
+
+                let ip = NetworkEndian::read_u32(&packet_data[0..4]);
+                let address = Ipv4Addr::new(((ip >> 24) & 0xFF) as u8,
+                                            ((ip >> 16) & 0xFF) as u8,
+                                            ((ip >> 8) & 0xFF) as u8,
+                                            (ip & 0xFF) as u8);
+
+                Ok(MDNSType::A(address))
+            }
+            0x1C => {
+                if packet_data.len() < (8 * 2) {
+                    return Err("Data section to small for IPV6 address".to_owned());
+                }
+
+                let mut ipv6_octets = [0u16; 8];
+                for ip_index in 0..8 {
+                    ipv6_octets[ip_index] =
+                        NetworkEndian::read_u16(&packet_data[(ip_index * 2)..((ip_index + 1) * 2)]);
+
+                }
+
+                Ok(MDNSType::AAAA(Ipv6Addr::new(ipv6_octets[0],
+                                                ipv6_octets[1],
+                                                ipv6_octets[2],
+                                                ipv6_octets[3],
+                                                ipv6_octets[4],
+                                                ipv6_octets[5],
+                                                ipv6_octets[6],
+                                                ipv6_octets[7])))
+            }
+            _ => Ok(MDNSType::UNKNOW(mdns_type_id)),
         }
     }
 }
@@ -101,7 +121,7 @@ struct MDNSData {
 #[derive(Debug)]
 struct MDNSQuestion {
     name: String,
-    rr_type: MDNSType,
+    rr_type_id: u16,
     rr_class: u16,
 }
 
@@ -237,7 +257,7 @@ fn parse_packet(packet: &[u8]) -> Result<MDNSData, String> {
         // Add the create and push the question struct
         result.questions.push(MDNSQuestion {
             name: label_string,
-            rr_type: MDNSType::from_u16(rr_type),
+            rr_type_id: rr_type,
             rr_class: class_type,
         });
     }
@@ -263,18 +283,24 @@ fn parse_packet(packet: &[u8]) -> Result<MDNSData, String> {
             NetworkEndian::read_u16(&packet[decode_position..(decode_position + 2)]) as usize;
         decode_position += 2;
 
-        trace!("Data len: {}, type: {:?}",
-               data_len,
-               MDNSType::from_u16(rr_type));
+        trace!("Data len: {}, type: {:x}", data_len, rr_type);
 
-        // Add the create and push the question struct
-        result.answers.push(MDNSAnswer {
-            name: label_string,
-            rr_type: MDNSType::from_data(rr_type,
-                                         &packet[decode_position..(decode_position + data_len)]),
-            rr_class: class_type,
-            ttl: ttl,
-        });
+        match MDNSType::from_data(rr_type,
+                                  &packet[decode_position..(decode_position + data_len)]) {
+            Ok(mdns_type) => {
+
+                // Add the create and push the question struct
+                result.answers.push(MDNSAnswer {
+                    name: label_string,
+                    rr_type: mdns_type,
+                    rr_class: class_type,
+                    ttl: ttl,
+                });
+            }
+            Err(e) => {
+                warn!("{}", e);
+            }
+        }
 
         decode_position += data_len;
 
