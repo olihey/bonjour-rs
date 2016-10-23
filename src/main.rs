@@ -33,12 +33,12 @@ struct MDNSPacketHeader {
 #[derive(Debug)]
 enum MDNSType {
     A(Ipv4Addr),
-    PTR,
+    PTR(String),
     TXT(Vec<String>),
     AAAA(Ipv6Addr),
-    SRV,
-    NSEC,
-    ANY,
+    // SRV,
+    // NSEC,
+    // ANY,
     UNKNOW(u16),
 }
 
@@ -47,23 +47,28 @@ impl MDNSType {
     pub fn to_u16(&self) -> u16 {
         match *self {
             MDNSType::A(_) => 0x01,
-            MDNSType::PTR => 0x0C,
+            MDNSType::PTR(_) => 0x0C,
             MDNSType::TXT(_) => 0x10,
             MDNSType::AAAA(_) => 0x1C,
-            MDNSType::SRV => 0x21,
-            MDNSType::NSEC => 0x2F,
-            MDNSType::ANY => 0xFF,
+            // MDNSType::SRV => 0x21,
+            // MDNSType::NSEC => 0x2F,
+            // MDNSType::ANY => 0xFF,
             MDNSType::UNKNOW(n) => n,
         }
     }
 
-    pub fn from_data(mdns_type_id: u16, packet_data: &[u8]) -> Result<MDNSType, String> {
+    pub fn from_data(mdns_type_id: u16,
+                     full_packet: &[u8],
+                     data_len: usize,
+                     offset: usize)
+                     -> Result<MDNSType, String> {
         match mdns_type_id {
             0x10 => {
                 let mut txt_map = vec![];
                 let mut data_offset: usize = 0;
-                while packet_data.len() > data_offset {
-                    let (label_string, label_size) = label_to_string(packet_data, data_offset);
+                while data_len > data_offset {
+                    let (label_string, label_size) = label_to_string(full_packet,
+                                                                     offset + data_offset);
                     trace!("TXT: {} {}", label_string, label_size);
                     txt_map.push(label_string);
                     data_offset += label_size;
@@ -72,11 +77,11 @@ impl MDNSType {
                 Ok(MDNSType::TXT(txt_map))
             }
             0x01 => {
-                if packet_data.len() < 4 {
+                if data_len < 4 {
                     return Err("Data section to small for IPV4 address".to_owned());
                 }
 
-                let ip = NetworkEndian::read_u32(&packet_data[0..4]);
+                let ip = NetworkEndian::read_u32(&full_packet[offset..(offset + 4)]);
                 let address = Ipv4Addr::new(((ip >> 24) & 0xFF) as u8,
                                             ((ip >> 16) & 0xFF) as u8,
                                             ((ip >> 8) & 0xFF) as u8,
@@ -85,14 +90,14 @@ impl MDNSType {
                 Ok(MDNSType::A(address))
             }
             0x1C => {
-                if packet_data.len() < (8 * 2) {
+                if data_len < (8 * 2) {
                     return Err("Data section to small for IPV6 address".to_owned());
                 }
 
                 let mut ipv6_octets = [0u16; 8];
                 for ip_index in 0..8 {
                     ipv6_octets[ip_index] =
-                        NetworkEndian::read_u16(&packet_data[(ip_index * 2)..((ip_index + 1) * 2)]);
+                        NetworkEndian::read_u16(&full_packet[(offset+(ip_index * 2))..(offset +((ip_index + 1) * 2))]);
 
                 }
 
@@ -105,6 +110,7 @@ impl MDNSType {
                                                 ipv6_octets[6],
                                                 ipv6_octets[7])))
             }
+            0x0C => Ok(MDNSType::PTR(decompress_label(full_packet, offset).0)),
             _ => Ok(MDNSType::UNKNOW(mdns_type_id)),
         }
     }
@@ -285,8 +291,7 @@ fn parse_packet(packet: &[u8]) -> Result<MDNSData, String> {
 
         trace!("Data len: {}, type: {:x}", data_len, rr_type);
 
-        match MDNSType::from_data(rr_type,
-                                  &packet[decode_position..(decode_position + data_len)]) {
+        match MDNSType::from_data(rr_type, packet, data_len, decode_position) {
             Ok(mdns_type) => {
 
                 // Add the create and push the question struct
