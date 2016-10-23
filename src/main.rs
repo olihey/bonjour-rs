@@ -22,7 +22,7 @@ use byteorder::{ByteOrder, NetworkEndian};
 #[derive(Debug)]
 #[derive(RustcEncodable, RustcDecodable)]
 struct MDNSPacketHeader {
-    id: u16, // transaction ID
+    id: u16,
     flags: u16,
     num_qn: u16,
     num_ans_rr: u16,
@@ -31,12 +31,20 @@ struct MDNSPacketHeader {
 }
 
 #[derive(Debug)]
+struct MDNSService {
+    priority: u16,
+    weight: u16,
+    port: u16,
+    name: String,
+}
+
+#[derive(Debug)]
 enum MDNSType {
     A(Ipv4Addr),
-    PTR(String),
+    PTR(String), // CNAME, NS ?
     TXT(Vec<String>),
     AAAA(Ipv6Addr),
-    // SRV,
+    SRV(MDNSService),
     // NSEC,
     // ANY,
     UNKNOW(u16),
@@ -50,7 +58,7 @@ impl MDNSType {
             MDNSType::PTR(_) => 0x0C,
             MDNSType::TXT(_) => 0x10,
             MDNSType::AAAA(_) => 0x1C,
-            // MDNSType::SRV => 0x21,
+            MDNSType::SRV(_) => 0x21,
             // MDNSType::NSEC => 0x2F,
             // MDNSType::ANY => 0xFF,
             MDNSType::UNKNOW(n) => n,
@@ -76,6 +84,7 @@ impl MDNSType {
                 trace!("{:?}", txt_map);
                 Ok(MDNSType::TXT(txt_map))
             }
+
             0x01 => {
                 if data_len < 4 {
                     return Err("Data section to small for IPV4 address".to_owned());
@@ -89,6 +98,7 @@ impl MDNSType {
 
                 Ok(MDNSType::A(address))
             }
+
             0x1C => {
                 if data_len < (8 * 2) {
                     return Err("Data section to small for IPV6 address".to_owned());
@@ -111,6 +121,16 @@ impl MDNSType {
                                                 ipv6_octets[7])))
             }
             0x0C => Ok(MDNSType::PTR(decompress_label(full_packet, offset).0)),
+
+            0x21 => {
+                Ok(MDNSType::SRV(MDNSService {
+                    priority: NetworkEndian::read_u16(&full_packet[offset..(offset + 2)]),
+                    weight: NetworkEndian::read_u16(&full_packet[(offset + 2)..(offset + 4)]),
+                    port: NetworkEndian::read_u16(&full_packet[(offset + 4)..(offset + 6)]),
+                    name: decompress_label(full_packet, offset + 6).0,
+                }))
+            }
+
             _ => Ok(MDNSType::UNKNOW(mdns_type_id)),
         }
     }
